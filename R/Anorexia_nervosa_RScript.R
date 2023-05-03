@@ -1,0 +1,497 @@
+#Load libraries
+library(tidyverse)
+library(corrr)
+library(tidygraph)
+library(igraph)
+library(ggraph)
+library(Hmisc)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(vegan)
+library(ggbiplot)
+library(limma)
+library(meshes)
+library(parameters)
+library(effectsize)
+library(patchwork)
+library(vegan)
+library(ggh4x)
+library(ggrepel)
+library(ggpubr)
+library(ComplexHeatmap)
+library(circlize)
+library(missForest)
+library(BiodiversityR)
+
+###Prepare working directory
+#Define extensions
+dir <- "~/R"
+ext <- c("Data", "Metadata")
+
+#List files in directory
+files <- list("Data" = list.files(paste(dir,ext[1],sep="/")),
+              "Metadata" = list.files(paste(dir,ext[2],sep="/")))
+
+#Set working directory
+setwd("~/R")
+
+###Upload data and metadata
+#Upload proteins data
+data <- read.table(paste(dir,ext[1],files[[1]][1],sep="/"),sep="\t",header = TRUE)
+data <- filter(data, !PG.Genes == NaN)
+
+#Upload metadata
+metadata <- readxl::read_xlsx(paste(dir,ext[2],files[[2]][3],sep="/"),1)
+meta.sel <- readxl::read_xlsx(paste(dir,ext[2],files[[2]][3],sep="/"),2)
+
+#Upload template
+template <- read.csv2(paste(dir,ext[2],files[[2]][5],sep="/"),header = TRUE)
+
+#Import functional data
+func.data <- readxl::read_xlsx(paste(dir,ext[2],files[[2]][1],sep="/"),2)[,c(1,12,13)]
+func.data <- dplyr::rename(func.data, PG.Genes = Gene)
+
+#Wrangle functional data
+annotations <- data[,3:5]
+annotations$PG.Genes <- gsub(";.*","",annotations$PG.Genes)
+func.data <- left_join(annotations,func.data)
+func.data$Function <- ifelse(func.data$Location =="Immunoglobulin","Immunoglobulin",func.data$Function)
+func.data$Function <- ifelse(is.na(func.data$Function) == TRUE,"No annotated function",func.data$Function)
+func.data <- left_join(func.data, readxl::read_xlsx(paste(dir,ext[2],files[[2]][4],sep="/"),3))
+
+###Wrangle data
+#Wrangle proteomics data
+counts <- data[,grepl("raw.PG.Quantity",colnames(data))]
+counts[counts == "Filtered"] <- NA
+counts <- apply(counts,2,FUN = as.numeric)
+
+##Generate matrix
+matrix <- as.matrix(counts) #convert data.frame to matrix
+rownames(matrix) <- data$PG.ProteinAccessions #Add protein names
+matrix <- t(matrix) #transpose matrix
+matrix <- matrix[-1,] #remove duplicate row
+rownames(matrix) <- template$biological.sample.id #add biological sample names
+matrix <- apply(matrix,2,FUN =log2) #correct character to number format
+
+#Impute missing values
+set.seed(2)
+imp <- as.data.frame(matrix) #convert data.frame to matrix
+imp <- imp[, -which(colMeans(is.na(imp)) > 0.3)]#remove columns with over 30% missing
+imp <- missForest::missForest(imp) #impute by random forest method
+imp <- imp$ximp #extract imputed dataset
+
+#Generate data.frame w/ metadata
+df <- imp #make duplicate object
+df$`biological sample id`<- rownames(df) #Add biological names 
+df<- right_join(metadata,df)  #append metadata to proteomics data
+df$Group <- factor(df$Group, levels = c("HC","Restrictive", "Binge"))
+
+###Mulivarate analysis and confounding assesment
+#Perform and visualize PCA
+pca <- rda(df[,67:ncol(df)],scale =TRUE,data = df)
+pca.c <- pca$CA$u %>% as.data.frame()
+pca.c$Group <- df$Group
+pca.plot <- ggplot(pca.c, aes(x = PC1, y = PC2, color = Group)) + geom_point() + stat_ellipse(level = 0.68) +
+  xlab(axis.long(pca, choices=c(1, 2))$label[1]) +
+  ylab(axis.long(pca, choices=c(1, 2))$label[2]) +
+  theme(aspect.ratio = 1,
+        panel.background = element_rect(fill = "white",
+                                        colour = "gray",
+                                        size = 0.5, linetype = "solid"),
+        legend.position = "bottom",
+        panel.grid.major = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA),
+        strip.text = element_text(size = 10),
+        axis.text.y =element_text(size = 10),
+        axis.text.x =element_text(size = 10),
+        panel.grid.minor = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA))
+
+#Fit and visualize PCA projections to clinical variables
+pca.fit <- envfit(pca ~ BMI + dWeight_month + CRP + Albumin + ALT + CIG + Age + TCHOL+ Creatinine +  HOMAir + TAG + Glucose + HDL + LDL, data = df,na.rm=TRUE)
+pca.vectors <- data.frame("Variable" = rownames(pca.fit$vectors$arrows),
+                          "PC1" =  pca.fit$vectors$arrows[,1],
+                          "PC2" =  pca.fit$vectors$arrows[,2],
+                          "p" = unname(pca.fit$vectors$pvals))
+pca.vectors$Sig <- ifelse(pca.vectors$p <0.05, "Significant","Not significant")
+fit.plot <- ggplot(pca.vectors,aes(x=PC1,y = PC2, label = Variable))  +
+  geom_segment(aes(x=0, y=0, xend=PC1, yend=PC2),
+               arrow=arrow(length=unit(0.2,"cm"),
+                           type = "closed"),color = "gray")+
+  geom_label_repel(color = "white",fill ="red") +
+  theme(aspect.ratio = 1,
+        panel.background = element_rect(fill = "white",
+                                        colour = "gray",
+                                        size = 0.5, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA),
+        strip.text = element_text(size = 10),
+        axis.text.y =element_text(size = 10),
+        axis.text.x =element_text(size = 10),
+        panel.grid.minor = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA)) +
+  scale_fill_manual(values = c("gray","red")) + 
+  scale_color_manual(values = c("gray","red"))
+
+#Ectract and visualize PCA loadings
+pca.load <- pca$CA$v[,1:2] %>% as.data.frame()
+pca.load$PG.ProteinAccessions  <- rownames(pca.load)
+pca.load <- left_join(pca.load, annotations)
+pca.load$sel <- ifelse(abs(pca.load$PC1) > 0.1 | abs(pca.load$PC2) > 0.1,pca.load$PG.Genes,"")
+pca.load$Eigen <- ifelse(abs(pca.load$PC1) > 0.1 | abs(pca.load$PC2) > 0.1,">0.1","<0.1")
+load.plot <- ggplot(pca.load,aes(x = PC1,y=PC2,label=sel,color=Eigen)) + geom_text_repel(size = 3.5) + geom_point(size = 2,alpha = 0.7) +
+  scale_color_manual(values = c("gray","red")) +
+  theme(aspect.ratio = 1,
+        panel.background = element_rect(fill = "white",
+                                        colour = "gray",
+                                        size = 0.5, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA),
+        strip.text = element_text(size = 10),
+        axis.text.y =element_text(size = 10),
+        axis.text.x =element_text(size = 10),
+        legend.position = "bottom",
+        panel.grid.minor = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA)) + scale_fill_manual(values = c("gray","red"))
+#Visualize multivariate data
+pca.plot + fit.plot +  load.plot  +plot_layout(widths = c(1, 1,1)) + plot_annotation(tag_levels = c('A', "B","C")) & 
+  theme(plot.tag = element_text(size = 22)) 
+
+###Univariate analysis
+#Calculate univariate statistics w/ linear models and design matrix (Limma)
+groups <- unique(df$Group) %>% as.character()
+stat.list <- list()
+for(i in seq_along(groups)){
+  lim.df <- df[,c(3,5,69:ncol(df))]
+  lim.df$Group <- as.character(lim.df$Group)
+  if(groups[i] == "HC") {
+    sel <- c(groups[1],groups[2])
+  }else{
+    sel <- c(groups[i],"HC")
+  }
+  lim.df <- filter(lim.df, Group %in% sel)
+  lim.df$Group <- factor(lim.df$Group,levels = sel)
+  lim.df$Group <- factor(lim.df$Group)
+  design <- model.matrix(~ 0 + lim.df$Group)
+  colnames(design) <- c("Group1","Group2")
+  lim.t <- t(lim.df[,c(-1,-2,-3)])
+  fit <- lmFit(lim.t, design)
+  contrast.matrix <- makeContrasts(Group1 - Group2,levels=design)
+  fit2 <- contrasts.fit(fit, contrast.matrix)
+  bayes <- eBayes(fit2)
+  tbl <- topTable(bayes, number = nrow(lim.t))
+  tbl$PG.ProteinAccessions <- rownames(tbl)
+  summary(decideTests(bayes))
+  tbl.anno <- left_join(annotations,tbl)
+  tbl.anno <- tbl.anno[!is.na(tbl.anno$logFC),]
+  tbl.anno$Significant <-
+    ifelse(tbl.anno$adj.P.Val < 0.05 & tbl.anno$logFC> 0, "Up (qval < 0.05)",
+           ifelse(tbl.anno$adj.P.Val < 0.05 & tbl.anno$logFC< 0,
+                  "Down (qval < 0.05)", ifelse(tbl.anno$P.Value < 0.05 & tbl.anno$logFC> 0,
+                                               "Up (pval < 0.05)", ifelse(
+                                                 tbl.anno$P.Value < 0.05 & tbl.anno$logFC< 0,"Down (pval < 0.05)", "No Change"
+                                               ))))
+  if(groups[i] == "HC") {
+    tbl.anno$Group <- paste(groups[1],"vs.",groups[2],sep = " ")
+  }else{
+    tbl.anno$Group <- paste(groups[i],"vs.","HC",sep = " ")
+  }
+  if(groups[i] == "HC") {
+    stat.list[[paste(groups[1],"vs.",groups[2],sep = " ")]] <- tbl.anno
+  }else{
+    stat.list[[paste(groups[i],"vs.","HC",sep = " ")]] <- tbl.anno
+  }
+  
+}
+
+#Coerce stat data.frames
+statistics.table <- rbind(stat.list[[1]],stat.list[[2]],stat.list[[3]])
+statistics.table$Group <- factor(statistics.table$Group,levels = c("Restrictive vs. HC","Binge vs. HC", "Restrictive vs. Binge"))
+statistics.table$Significant <- factor(statistics.table$Significant,levels = c("Down (qval < 0.05)","Down (pval < 0.05)","No Change", "Up (pval < 0.05)","Up (qval < 0.05)"))
+statistics.table$sel <- ifelse(abs(statistics.table$logFC) > 0.58 & statistics.table$P.Value <0.05, statistics.table$PG.Genes, "")
+statistics.table$sel2 <- ifelse(abs(statistics.table$logFC) > 0 & statistics.table$P.Value <0.05, statistics.table$PG.Genes, "")
+
+#Visualize Volcano plot
+vol.plot <-ggplot(statistics.table, aes(x = logFC, y = -log10(P.Value),color = Significant,label = sel)) + geom_point(size = 3.5,alpha=0.6) + facet_nested_wrap(~Group) +
+  geom_text_repel(size = 2) +
+  scale_color_manual(values = c("#00BFFF","#99CCFF", "gray","#FF99AA","red")) +
+  geom_vline(xintercept = 0,linetype="dashed", 
+             color = "black", size = 0.3) +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed",
+             color = "black", size = 0.3) + theme(panel.background = element_rect(fill = "white",
+                                                                                  colour = "gray",
+                                                                                  size = 0.5, linetype = "solid"),
+                                                  panel.grid.major = element_line(size = 0.15, linetype = 'dashed',
+                                                                                  colour = NA), 
+                                                  strip.text = element_text(size = 10),
+                                                  legend.position = "right",
+                                                  axis.text.x =element_text(size = 10),
+                                                  axis.text.y =element_text(size = 10),
+                                                  legend.key.size = unit(0.4, 'cm'),
+                                                  panel.grid.minor = element_line(size = 0.15, linetype = 'dashed',
+                                                                                  colour = NA))
+#Append functional data to univariate statistics
+statistics.table <- left_join(statistics.table, func.data[,c(1,4:6)])
+statistics.table$rank <- sign(statistics.table$logFC)*-log10(statistics.table$P.Value)
+statistics.table$Function <- ifelse(statistics.table$Function =="No annotated function","Other",statistics.table$Function)
+statistics.table$Function <- ifelse(statistics.table$Function =="Cell adhesion","Other",statistics.table$Function)
+statistics.table$Function <- ifelse(statistics.table$Function =="Developmental protein","Other",statistics.table$Function)
+statistics.table$Group <- factor(statistics.table$Group,levels = c("Restrictive vs. Binge","Binge vs. HC","Restrictive vs. HC"))
+statistics.table$Category <- factor(statistics.table$Category,levels = c("Classical plasma proteins","Immunity and defense","Inflammation",
+                                                                         "Hormones","Enzymes","Transport","Other"))
+#summarize and visualize univariate statistics
+summary.stat <- statistics.table %>% group_by(Group,Category,Function,Significant) %>% tally()
+qr.plot <- ggplot(summary.stat,aes(y = Group, x = n,fill = Significant)) + geom_bar(stat ="identity") + 
+  facet_nested(~Category + Function,
+               scales = "free",
+               nest_line = element_line(
+                 color = "white",
+                 linetype = 1)) +
+  scale_fill_manual(values = c("#00BFFF","#99CCFF", "#E9EBEE","#FF99AA","red")) +
+  scale_x_continuous(label = ~ scales::comma(.x, accuracy = 1)) +
+  theme(panel.background = element_rect(fill = "white",
+                                        colour = "white",
+                                        size = 0.5, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA),
+        strip.text = element_text(size = 10),
+        axis.text.y =element_text(size = 10),
+        legend.key.size = unit(0.4, 'cm'),
+        axis.title.y = element_blank(),
+        legend.position = "right")+
+  xlab("Count")
+
+#Extract significant features from univariate statistical analysis
+features <- unique(c(filter(stat.list$`Restrictive vs. HC`, adj.P.Val < 0.05)$PG.ProteinAccessions,
+                     filter(stat.list$`Binge vs. HC`, adj.P.Val < 0.05)$PG.ProteinAccessions,
+                     filter(stat.list$`Restrictive vs. Binge`, adj.P.Val < 0.05)$PG.ProteinAccessions))
+sig.table <- filter(statistics.table, Function %in% c("Acute phase","Apolipoprotein","Blood coagulation","Immunoglobulin"))
+sig.table <- filter(sig.table, Group == "Restrictive vs. Binge")
+sig.table <- filter(sig.table, PG.ProteinAccessions %in% features)
+sig.table <- sig.table %>% arrange(desc(logFC)) %>% group_by(Category,Function) %>% top_n(n=3,wt= -adj.P.Val)
+
+
+#Manualual select and visualize features of interest
+scaled.df <- df
+scaled.df[,c(67:ncol(scaled.df))] <- apply(scaled.df[,c(67:ncol(scaled.df))],2,FUN = function(x){scale(x,scale = TRUE,center = TRUE)})
+gather.df <- gather(scaled.df[,c(5,67:ncol(scaled.df))], key = "PG.ProteinAccessions",value = "logLFQ",2:ncol(scaled.df[,c(5,67:ncol(scaled.df))]))
+gather.df <- left_join(gather.df, func.data[,c(1,4:6)])
+gather.df <- left_join(gather.df, annotations)
+gather.df <- filter(gather.df, PG.Genes %in% c("C2","C3","APOE","APOL1","F11","F9","IGKV1-27","IGLV6-57"))
+gather.df$Group <- factor(gather.df$Group,levels = c("HC","Restrictive","Binge"))
+dot.plot <- ggplot(gather.df, aes(x = PG.Genes, y = logLFQ, fill = Group,color = Group, alpha = 0.3)) +
+  geom_boxplot(position=position_dodge(0.4),width=0.2,outlier.size = 1,size = 0.6) + 
+  facet_nested_wrap(~Function + PG.Genes ,scales = "free",strip = strip_nested(bleed = FALSE),nrow = 1)+
+  ylim(-3,3) +
+  geom_hline(yintercept = 0,linetype="dashed", 
+             color = "black", size = 0.3) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background = element_rect(fill = "white",
+                                        colour = "gray",
+                                        size = 0.5, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA),
+        strip.text = element_text(size = 10),
+        axis.text.y =element_text(size = 10),
+        ggh4x.facet.nestline = element_line(colour = "white"),
+        legend.key.size = unit(0.4, 'cm'),
+        #axis.title.y = element_blank(),
+        legend.position = "right") +
+  stat_compare_means(method = "anova",label = "p.format") +
+  xlab("")
+
+#Visualize univariate data
+(vol.plot/qr.plot)/dot.plot + 
+  plot_layout(heights = c(0.8, 0.5,1)) + plot_annotation(tag_levels = 'A')& 
+  theme(plot.tag = element_text(size = 20))
+
+
+###Intra-disease correlation analysis
+#Define clinical variables
+vars <- c("Binge", "Restrictive","BMI","dWeight_month","in_patient","Age","CIG","Albumin","ALT","TAG","TCHOL","HOMAir","Hb","PLT","WBC","SSRI","Antipsychotics","Psychiatric comorbidty",
+          "Benzodiazepines")
+#Perform correlation analysis
+cor.matrix <- df[!df$Group == "HC",]
+cor.list <- list()
+for(i in seq_along(vars)){
+  for(r in seq_along(features)){
+    cors <- cor.test(pull(cor.matrix, var = vars[i]),pull(cor.matrix, var = features[r]))
+    cor.list[[paste(i,r)]] <- data.frame("Variable" = vars[i],
+                                         "PG.ProteinAccessions" = features[r],
+                                         "r" = unname(cors$estimate),
+                                         "p" = cors$p.value)
+  }
+}
+#Append correlation elements into a dataframe
+cor.table <- cor.list[[1]]
+for(r in seq(2,length(cor.list))){
+  cor.table <- rbind(cor.table,cor.list[[r]])
+}
+#Spread data into a matrix
+cor.spread <- spread(cor.table[,c(1:3)],key =2,value=3)
+rownames(cor.spread) <- cor.spread$Variable
+cor.spread <- cor.spread[,-1] %>% as.matrix()
+#Visualize correlation matrix heatmap
+set.seed(1)
+heatmap <-ComplexHeatmap::Heatmap(cor.spread,
+                                  name = "heatmap",
+                                  colorRamp2(c(-0.5, 0, 0.5),c("blue", "white", "red"), space = "LAB"),
+                                  cluster_rows = TRUE,
+                                  cluster_columns = TRUE,
+                                  show_row_names = TRUE,
+                                  #row_names_gp = gpar(fontsize = 2),
+                                  column_title_side = "bottom",
+                                  #row_km = 3,
+                                  #column_km = 3,
+                                  row_split = 4,
+                                  column_split = 4,
+                                  row_gap = unit(2, "mm"),
+                                  column_gap = unit(2, "mm"),
+                                  show_column_names = FALSE,
+                                  #column_names_gp = gpar(fontsize = 5),
+                                  column_names_rot = 45,
+                                  #column_title_gp = gpar(fontsize = 8),
+                                  heatmap_legend_param = list(title = "cor"),
+                                  cluster_row_slices =  FALSE,
+                                  cluster_column_slices =  FALSE,
+                                  row_dend_gp = gpar(col = "black"),
+                                  border = FALSE,
+                                  row_title_rot = 0,
+                                  column_title_rot = 0,
+                                  #rect_gp = gpar(col= "white", unit(0.005, "mm")),
+                                  #heatmap_width = unit(20, "cm"),
+                                  #heatmap_height = unit(20, "cm"),
+                                  row_dend_width = unit(2, "cm"),
+                                  column_dend_height = unit(2, "cm"),
+                                  row_dend_side = "right",
+                                  column_title = c("B1", "B2", "B3","B4"),
+                                  row_title = c("C1", "C2", "C3","C4"))
+
+###Protein-clinical network
+#Fit linear models
+protein <- features
+aov.list<- list()
+for(r in seq_along(protein)){
+  formula <- as.formula(paste("`",protein[r],"`","~Group + ALT + BMI",sep=""))
+  input <- df[!df$Group == "HC",]
+  input$Group <- factor(input$Group,levels =c("Binge","Restrictive"))
+  fit <- lm(formula,data = input)
+  stand <- parameters::model_parameters(fit,standardize = "refit")
+  stand <- filter(stand, !Parameter == "(Intercept)")
+  if(nrow(stand) == 0){
+    
+  }else{
+    stand$PG.ProteinAccessions  <- protein[r]
+    aov.list[[protein[r]]] <- stand
+  }
+}
+#Coerce aov.table
+aov.table <- aov.list[[1]]
+for(i in seq(2,length(aov.list))){
+  aov.table <- rbind(aov.table,aov.list[[i]])
+}
+
+aov.table <- left_join(aov.table, annotations[,1:2])
+
+###Prepare network
+effect.table <- aov.table[,c(1,11,2,9)]
+rownames(effect.table) <- NULL
+colnames(effect.table) <- c("x","y","Coeff","p")
+effect.table <- filter(effect.table, p < 0.05)
+effect.table <- effect.table[!is.na(effect.table$y),]
+effect.table$PG.Genes <- effect.table$y
+effect.table <- left_join(effect.table, func.data[,c(2,4:6)])
+graph_cors <- graph_from_data_frame(effect.table, directed = FALSE) %>% as_tbl_graph()  %>% 
+  activate(nodes) %>% dplyr::mutate(community = as.factor(group_louvain()))%>% 
+  activate(nodes) %>% dplyr::mutate(pagerank = centrality_pagerank())
+
+network <- ggraph(graph_cors) +
+  geom_edge_link(aes(edge_alpha = abs(Coeff), color = Coeff,edge_width = Coeff)) +
+  scale_edge_width(range = c(0.25, 2)) +
+  guides(edge_alpha = "none", edge_width = "none") +
+  scale_edge_colour_gradientn(#limits = c(-0.7,0.7), 
+    colors = c("blue","white","red")) +
+  scale_radius(range = c(5,13),guide="none") +
+  geom_node_point(aes(color = community, size = pagerank)) +
+  geom_node_text(aes(label = name),size = 2,repel = FALSE)
+
+#Extract communities from network
+community.df  <- activate(graph_cors,nodes) %>% as_tibble() %>% as.data.frame()
+colnames(community.df) <- c("Gene", "Community","PageRank")
+community.df <- community.df[,-3]
+community.df$Cluster <- NA
+for(r in seq_along(unique(community.df$Community))){
+  community.df[community.df$Community == unique(community.df$Community)[r],]$Cluster <- paste(filter(community.df,Community == unique(community.df$Community)[r])$Gene[filter(community.df,Community == unique(community.df$Community)[r])$Gene %in% unique(effect.table$x)],collapse = "_")
+}
+community.df <- filter(community.df, !Gene %in% unique(effect.table$x))
+community.df <- dplyr::rename(community.df, PG.Genes = Gene)
+
+#Extract gene communities
+community.list <- list()
+n <- unique(community.df$Cluster)
+for(r in seq_along(unique(community.df$Cluster))){
+  community.list[[n[r]]] <- filter(community.df, Cluster == unique(community.df$Cluster)[r])$PG.Genes
+}
+
+#Convert EntrezGeneSymbol to EntrezGeneID
+for(r in seq_along(community.list)){
+  community.list[[r]] <- bitr(community.list[[r]],OrgDb= org.Hs.eg.db,fromType = "SYMBOL",toType ="ENTREZID")$ENTREZID
+}
+
+#Prepare gene universe
+universe <- annotations$PG.Genes
+#Convert EntrezGeneSymbol to EntrezGeneID
+universe <- bitr(universe,OrgDb= org.Hs.eg.db,fromType = "SYMBOL",toType ="ENTREZID")$ENTREZID
+#Perform cluster enrichment
+ora.list <- list()
+for(r in seq_along(community.list)){
+  ora.list[[names(community.list)[r]]] <- enrichGO(gene = community.list[[r]],
+                                                   universe = universe,
+                                                   OrgDb = org.Hs.eg.db,
+                                                   maxGSSize = 150,
+                                                   minGSSize = 15,
+                                                   ont = "BP",
+                                                   pvalueCutoff = 0.05)@result
+  print(paste("ORA performed for",names(community.list)[r],sep =" "))
+}
+
+#Coerce to data.frame
+ora.df <- ora.list[[1]][1:5,]
+ora.df$Cluster <- names(ora.list)[1]
+ora.df$Order <- 1
+for(r in seq(2,length(ora.list))){
+  frame <- ora.list[[r]][1:5,]
+  frame$Cluster <- names(ora.list)[r]
+  frame$Order <- r
+  ora.df<- rbind(ora.df,frame)
+}
+
+#ORA Visualization
+ora.network <- ggplot(ora.df,aes(x = Cluster, y = reorder(Description,Order),color = pvalue, size = Count)) + 
+  geom_point() + scale_color_viridis_c()+
+  facet_wrap(~Cluster,scales = "free_x",nrow=1) +
+  ylab("")+
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.background = element_rect(fill = "white",
+                                        colour = "gray",
+                                        size = 0.5, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'dashed',
+                                        colour = NA))
+
+
+
+#Visualize clinica-protein network and ORA 
+(network/ora.network) + plot_annotation(tag_levels = 'A')& 
+  theme(plot.tag = element_text(size = 20))
+
+
+
