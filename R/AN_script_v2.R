@@ -23,6 +23,10 @@ library(ComplexHeatmap)
 library(circlize)
 library(missForest)
 library(BiodiversityR)
+library(mixOmics)
+library(AnnotationDbi)
+library(GO.db)
+library(org.Hs.eg.db)
 
 ###Prepare working directory
 #Define extensions
@@ -333,19 +337,52 @@ cor.table <- cor.list[[1]]
 for(r in seq(2,length(cor.list))){
   cor.table <- rbind(cor.table,cor.list[[r]])
 }
+
 #Spread data into a matrix
 cor.spread <- spread(cor.table[,c(1:3)],key =2,value=3)
 rownames(cor.spread) <- cor.spread$Variable
 cor.spread <- cor.spread[,-1] %>% as.matrix()
+
+#Add protein annotations
+cor.anno <- cor.table
+cor.anno <- left_join(cor.table, func.data)
+cor.anno$select <- ifelse(cor.anno$Function == "Apolipoprotein" | cor.anno$Function == "Immunoglobulin" | cor.anno$Function == "Blood coagulation" |
+                            cor.anno$Function == "Complement pathway", cor.anno$Function, "Other")
+cor.anno <- cor.anno[!duplicated(cor.anno$PG.ProteinAccessions),]
+cor.anno <- cor.anno[cor.anno$PG.ProteinAccessions %in% colnames(cor.spread),]
+
+#Convert column names
+colnames(cor.spread) <- cor.anno$PG.Genes
+
+vec.anno <- cor.anno$select
+names(vec.anno) <- cor.anno$PG.Genes
+vec.anno <- vec.anno[order(match(names(vec.anno),colnames(cor.spread)))]
+
+#Present names annotation
+heatmap.anno <- HeatmapAnnotation(Type =vec.anno, 
+                                  col = list(Type = c("Apolipoprotein" = "orange",
+                                                      "Immunoglobulin" = "blue",
+                                                      "Blood coagulation" = "red",
+                                                      "Complement pathway" = "green",
+                                                      "Other" = "#E9EBEE")),
+                                  annotation_name_gp = gpar(fontface = "bold"),
+                                  show_legend = TRUE)
+
+#Present protein names
+name.highlight = columnAnnotation(Protein = anno_mark(at = which(vec.anno %in% c("Apolipoprotein","Blood coagulation","Complement pathway")), 
+                                   labels = names(vec.anno)[which(vec.anno %in% c("Apolipoprotein","Blood coagulation","Complement pathway"))],
+                                   labels_gp = gpar(fontsize = 8),
+                                   side = "bottom"))
+
+
 #Visualize correlation matrix heatmap
 set.seed(1)
 heatmap <-ComplexHeatmap::Heatmap(cor.spread,
                                   name = "heatmap",
-                                  colorRamp2(c(-0.5, 0, 0.5),c("blue", "white", "red"), space = "LAB"),
+                                  colorRamp2(c(-0.4, 0, 0.4),c("cyan", "black", "red"), space = "LAB"),
                                   cluster_rows = TRUE,
                                   cluster_columns = TRUE,
                                   show_row_names = TRUE,
-                                  #row_names_gp = gpar(fontsize = 2),
                                   column_title_side = "bottom",
                                   #row_km = 3,
                                   #column_km = 3,
@@ -364,6 +401,9 @@ heatmap <-ComplexHeatmap::Heatmap(cor.spread,
                                   border = FALSE,
                                   row_title_rot = 0,
                                   column_title_rot = 0,
+                                 bottom_annotation =  name.highlight,
+                                top_annotation = heatmap.anno,
+                                                           
                                   #rect_gp = gpar(col= "white", unit(0.005, "mm")),
                                   #heatmap_width = unit(20, "cm"),
                                   #heatmap_height = unit(20, "cm"),
@@ -489,9 +529,23 @@ ora.network <- ggplot(ora.df,aes(x = Cluster, y = reorder(Description,Order),col
 
 
 
-#Visualize clinica-protein network and ORA 
+#Visualize clinica-protein network and ORA results                                                                                                                                                                                                                                                                  colour = NA))
 (network/ora.network) + plot_annotation(tag_levels = 'A')& 
   theme(plot.tag = element_text(size = 20))
 
+##Add Supplementary GO Data
+GOIDs <- as.character(ora.df$ID)
+go.terms <- AnnotationDbi::select(GO.db, keys=GOIDs, columns=c("GOID","TERM"), keytype="GOID")
+go.annotations <- AnnotationDbi::select(org.Hs.eg.db, keys=GOIDs, columns=c("SYMBOL","GO"), keytype="GO")
+go.annotations <- dplyr::rename(go.annotations, PG.Genes = SYMBOL)
+go.annotations <- dplyr::rename(go.annotations, GOID = GO)
+go.annotations <- left_join(go.annotations,go.terms)
+stat.table.go <-left_join(statistics.table[,1:11],go.annotations)
+stat.table.go <- stat.table.go[!is.na(stat.table.go$GOID),]
 
-
+##Add PLSDA
+pls <- plsda(df[,67:ncol(df)],df$Group)
+pls.coord <- pls$variates$X %>% as.data.frame()
+pls.coord$Group <- df$Group
+ggplot(pls.coord,aes(x = comp1,y=comp2,color = Group)) + geom_point(size = 3,alpha = 0.75) +
+  stat_ellipse(level = 0.95)
